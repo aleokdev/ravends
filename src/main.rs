@@ -80,6 +80,10 @@ enum Commands {
         ///
         /// If empty, the software will create a folder of the same name as the ROM in its same path, and unpack it there.
         target_path: Option<PathBuf>,
+
+        /// If set, the software will not do any modifications on the file system
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
     /// Pack a directory's contents to a ROM file
     Pack {
@@ -131,9 +135,13 @@ fn main() -> anyhow::Result<()> {
         Commands::Unpack {
             rom_path,
             target_path,
+            dry_run,
         } => {
             let target_path = target_path.unwrap_or_else(|| rom_path.with_extension(""));
-            std::fs::create_dir_all(&target_path).context("failed to create target directory")?;
+            if !dry_run {
+                std::fs::create_dir_all(&target_path)
+                    .context("failed to create target directory")?;
+            }
 
             let mut rom_data = Vec::new();
             std::io::BufReader::new(fs::File::open(rom_path)?).read_to_end(&mut rom_data)?;
@@ -152,8 +160,10 @@ fn main() -> anyhow::Result<()> {
                 print!("{:?}: ", entry.path);
 
                 let mut target_entry_path = target_path.join(&entry.path);
-                std::fs::create_dir_all(target_entry_path.parent().unwrap())
-                    .context("failed to create directory in target")?;
+                if !dry_run {
+                    std::fs::create_dir_all(target_entry_path.parent().unwrap())
+                        .context("failed to create directory in target")?;
+                }
 
                 let file_data = &rom_data[entry.alloc.start as usize..entry.alloc.end as usize];
 
@@ -181,16 +191,21 @@ fn main() -> anyhow::Result<()> {
                         }
                     };
 
-                    fs::File::create(target_entry_path)
-                        .context("failed to create file in target directory")?
-                        .write_all(&data_to_write)
-                        .context("failed to write file in target directory")?;
+                    if !dry_run {
+                        fs::File::create(target_entry_path)
+                            .context("failed to create file in target directory")?
+                            .write_all(&data_to_write)
+                            .context("failed to write file in target directory")?;
+                    }
                 } else {
                     println!("unknown format");
-                    fs::File::create(target_entry_path)
-                        .context("failed to create file in target directory")?
-                        .write_all(&file_data)
-                        .context("failed to write file in target directory")?;
+
+                    if !dry_run {
+                        fs::File::create(target_entry_path)
+                            .context("failed to create file in target directory")?
+                            .write_all(&file_data)
+                            .context("failed to write file in target directory")?;
+                    }
                 };
             }
         }
