@@ -1,0 +1,5 @@
+[[strings]]
+// Index {{index}}
+text = '''
+{{text}}'''
+

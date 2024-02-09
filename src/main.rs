@@ -1,12 +1,14 @@
 use std::{
+    char::DecodeUtf16Error,
     io::{Read, Write},
     path::{Path, PathBuf},
+    string::FromUtf16Error,
 };
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
-use thiserror::Error;
 use std::fs;
+use thiserror::Error;
 
 use byteorder::ReadBytesExt;
 
@@ -16,16 +18,16 @@ enum Lz10DecompressionError {
     Io(#[from] std::io::Error),
     #[error("invalid decompressed size (0)")]
     InvalidSize,
-    #[error("error while referencing past data; data might not be LZ10 compressed")]
+    #[error("error while referencing past data")]
     CannotReferencePastData,
-    #[error("magic number does not match")]
-    MagicNumberMismatch
+    #[error("magic number does not match (found: 0x{found:x}, expected: 0x10)")]
+    MagicNumberMismatch { found: u8 },
 }
 
 fn decompress_lz10(mut reader: impl Read) -> Result<Vec<u8>, Lz10DecompressionError> {
     let magic_num = reader.read_u8()?;
     if magic_num != 0x10 {
-        return Err(Lz10DecompressionError::MagicNumberMismatch);
+        return Err(Lz10DecompressionError::MagicNumberMismatch { found: magic_num });
     }
     let uncompressed_file_size = reader.read_u24::<byteorder::LittleEndian>()?;
     if uncompressed_file_size == 0 {
@@ -56,6 +58,33 @@ fn decompress_lz10(mut reader: impl Read) -> Result<Vec<u8>, Lz10DecompressionEr
     Ok(output)
 }
 
+#[derive(Error, Debug)]
+enum ParseTextError {
+    #[error("file read error")]
+    Io(#[from] std::io::Error),
+    #[error("UTF-16 character decode error")]
+    Utf16(#[from] DecodeUtf16Error),
+}
+
+fn parse_text_file(data: &[u8]) -> Result<Vec<String>, ParseTextError> {
+    let mut header = data;
+    let text_count = header.read_u32::<byteorder::LittleEndian>()?;
+    (0..text_count)
+        .map(|_| {
+            let pointer = header.read_u32::<byteorder::LittleEndian>()? as usize;
+            let pointer_data = &data[pointer..];
+            char::decode_utf16(
+                pointer_data
+                    .chunks_exact(2)
+                    .map(|ch| u16::from_le_bytes(ch.try_into().unwrap()))
+                    .take_while(|&ch| ch != 0),
+            )
+            .collect::<Result<String, _>>()
+            .map_err(ParseTextError::from)
+        })
+        .collect::<Result<Vec<String>, _>>()
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "ravends")]
 #[command(about = "NDS unpacking & patching tool", long_about = None)]
@@ -66,6 +95,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Try to decompress a file using the LZ10 algorithm
+    Decompress {
+        /// Path of the file to decompress
+        path: PathBuf,
+        /// Where to place the resulting file
+        ///
+        /// If empty, `path + .decomp` will be used instead
+        target_path: Option<PathBuf>,
+    },
+    /// Try to identify a file from its contents
+    Identify {
+        /// Path of the file to identify
+        path: PathBuf,
+    },
     /// Unpack a ROM file's contents to a directory
     Unpack {
         /// The ROM file to unpack
@@ -90,6 +133,37 @@ fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
 
     match args.command {
+        Commands::Decompress { path, target_path } => {
+            let target_path = target_path.unwrap_or_else(|| path.join(".decomp"));
+
+            let reader = std::io::BufReader::new(fs::File::open(path).context("failed to open file given")?);
+
+            let data = decompress_lz10(reader).context("failed to decompress file")?;
+
+            fs::File::create(target_path)?.write_all(&data)?;
+        }
+        Commands::Identify { path } => {
+            let mut data = Vec::new();
+            fs::File::open(path)
+                .context("could not open file to idenfify")?
+                .read_to_end(&mut data)
+                .context("could not read file to idenfify")?;
+
+            if let Ok(decompressed_data) = decompress_lz10(data.as_slice()) {
+                print!("compressed LZ10 file, ");
+                match parse_text_file(&decompressed_data) {
+                    Ok(_) => {
+                        println!("text file");
+                    }
+                    Err(_) => {
+                        println!("unknown contents");
+                    }
+                };
+            } else {
+                println!("unknown format");
+            };
+        }
+
         Commands::Unpack {
             rom_path,
             target_path,
@@ -106,21 +180,53 @@ fn main() -> anyhow::Result<()> {
             let fat_addr = u32::from_le_bytes(rom_data[0x48..=0x4B].try_into().unwrap()) as usize;
             let fat_size = u32::from_le_bytes(rom_data[0x4C..=0x4F].try_into().unwrap()) as usize;
 
-            let fs = nitro_fs::FileSystem::new(&rom_data[fnt_addr..(fnt_addr+fnt_size)], &rom_data[fat_addr..(fat_addr+fat_size)])?;
+            let fs = nitro_fs::FileSystem::new(
+                &rom_data[fnt_addr..(fnt_addr + fnt_size)],
+                &rom_data[fat_addr..(fat_addr + fat_size)],
+            )?;
             for entry in fs.files() {
                 print!("{:?}: ", entry.path);
-                
-                let target_entry_path = target_path.join(&entry.path);
-                std::fs::create_dir_all(target_entry_path.parent().unwrap()).context("failed to create directory in target")?;
 
-                let file_data = &rom_data[entry.alloc.start as usize .. entry.alloc.end as usize];
-                
-                if let Ok(decompressed_data) = decompress_lz10(std::io::BufReader::new(file_data)) {
-                    println!("compressed LZ10 file, unknown contents");
-                    fs::File::create(target_entry_path).context("failed to create file in target directory")?.write_all(&decompressed_data).context("failed to write file in target directory")?;
+                let mut target_entry_path = target_path.join(&entry.path);
+                std::fs::create_dir_all(target_entry_path.parent().unwrap())
+                    .context("failed to create directory in target")?;
+
+                let file_data = &rom_data[entry.alloc.start as usize..entry.alloc.end as usize];
+
+                if let Ok(decompressed_data) = decompress_lz10(file_data) {
+                    print!("compressed LZ10 file, ");
+                    target_entry_path.set_extension("decomp");
+                    let data_to_write = match parse_text_file(&decompressed_data) {
+                        Ok(strings) => {
+                            println!("text file");
+                            target_entry_path.set_extension("txt");
+                            strings
+                                .into_iter()
+                                .enumerate()
+                                .map(|(idx, str)| {
+                                    include_str!("text_entry_template")
+                                        .replace("{{text}}", &str)
+                                        .replace("{{index}}", &idx.to_string())
+                                })
+                                .collect::<String>()
+                                .into_bytes()
+                        }
+                        Err(_) => {
+                            println!("unknown contents");
+                            decompressed_data
+                        }
+                    };
+
+                    fs::File::create(target_entry_path)
+                        .context("failed to create file in target directory")?
+                        .write_all(&data_to_write)
+                        .context("failed to write file in target directory")?;
                 } else {
                     println!("unknown format");
-                    fs::File::create(target_entry_path).context("failed to create file in target directory")?.write_all(&file_data).context("failed to write file in target directory")?;
+                    fs::File::create(target_entry_path)
+                        .context("failed to create file in target directory")?
+                        .write_all(&file_data)
+                        .context("failed to write file in target directory")?;
                 };
             }
         }
