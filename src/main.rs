@@ -21,14 +21,20 @@ enum ParseTextError {
     Io(#[from] std::io::Error),
     #[error("UTF-16 character decode error")]
     Utf16(#[from] DecodeUtf16Error),
+    #[error("invalid pointer found on header")]
+    InvalidPointer,
 }
 
 fn parse_text_file(data: &[u8]) -> Result<Vec<String>, ParseTextError> {
     let mut header = data;
-    let text_count = header.read_u32::<byteorder::LittleEndian>()?;
+    let text_count = header.read_u32::<byteorder::LittleEndian>()? as usize;
+    let header_size = text_count * std::mem::size_of::<u32>();
     (0..text_count)
         .map(|_| {
             let pointer = header.read_u32::<byteorder::LittleEndian>()? as usize;
+            if pointer < header_size {
+                return Err(ParseTextError::InvalidPointer);
+            }
             let pointer_data = &data[pointer..];
             char::decode_utf16(
                 pointer_data
@@ -39,7 +45,7 @@ fn parse_text_file(data: &[u8]) -> Result<Vec<String>, ParseTextError> {
             .collect::<Result<String, _>>()
             .map_err(ParseTextError::from)
         })
-        .collect::<Result<Vec<String>, _>>()
+        .collect()
 }
 
 #[derive(Debug, Parser)]
