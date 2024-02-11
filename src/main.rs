@@ -1,5 +1,6 @@
 use std::{
     char::DecodeUtf16Error,
+    collections::HashMap,
     io::{Read, Write},
     path::{Path, PathBuf},
     string::FromUtf16Error,
@@ -7,6 +8,7 @@ use std::{
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
 use lz10::decompress_lz10;
 use std::fs;
 use thiserror::Error;
@@ -156,8 +158,19 @@ fn main() -> anyhow::Result<()> {
                 &rom_data[fnt_addr..(fnt_addr + fnt_size)],
                 &rom_data[fat_addr..(fat_addr + fat_size)],
             )?;
-            for entry in fs.files() {
-                print!("{:?}: ", entry.path);
+
+            let mut file_type_count: HashMap<&str, usize> =
+                HashMap::with_capacity(fs.files().len());
+            let progress_bar = ProgressBar::new(fs.files().len() as u64)
+                .with_style(
+                    ProgressStyle::default_bar()
+                        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
+                        .unwrap()
+                        .progress_chars("##-"),
+                )
+                .with_prefix("Unpacking ");
+            for entry in fs.files().iter().progress_with(progress_bar.clone()) {
+                progress_bar.set_message(entry.path.to_string_lossy().to_string());
 
                 let mut target_entry_path = target_path.join(&entry.path);
                 if !dry_run {
@@ -168,11 +181,12 @@ fn main() -> anyhow::Result<()> {
                 let file_data = &rom_data[entry.alloc.start as usize..entry.alloc.end as usize];
 
                 if let Ok(decompressed_data) = decompress_lz10(file_data) {
-                    print!("compressed LZ10 file, ");
+                    // print!("compressed LZ10 file, ");
                     target_entry_path.set_extension("decomp");
                     let data_to_write = match parse_text_file(&decompressed_data) {
                         Ok(strings) => {
-                            println!("text file");
+                            // println!("text file");
+                            *file_type_count.entry("LZ10 compressed, text").or_default() += 1;
                             target_entry_path.set_extension("txt");
                             strings
                                 .into_iter()
@@ -186,7 +200,10 @@ fn main() -> anyhow::Result<()> {
                                 .into_bytes()
                         }
                         Err(_) => {
-                            println!("unknown contents");
+                            // println!("unknown contents");
+                            *file_type_count
+                                .entry("LZ10 compressed, unknown")
+                                .or_default() += 1;
                             decompressed_data
                         }
                     };
@@ -198,7 +215,8 @@ fn main() -> anyhow::Result<()> {
                             .context("failed to write file in target directory")?;
                     }
                 } else {
-                    println!("unknown format");
+                    // println!("unknown format");
+                    *file_type_count.entry("unknown").or_default() += 1;
 
                     if !dry_run {
                         fs::File::create(target_entry_path)
@@ -208,6 +226,9 @@ fn main() -> anyhow::Result<()> {
                     }
                 };
             }
+            progress_bar.finish();
+
+            //term_table::TableBuilder::new().
         }
 
         Commands::Pack { fs_path, rom_path } => {
